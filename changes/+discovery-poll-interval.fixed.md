@@ -1,0 +1,1 @@
+Honour `DNSWEAVER_SOURCE_<NAME>_POLL_INTERVAL` / `file_discovery.poll_interval`. The discovery poller was always created with its 60s default, so configured intervals had no effect; it now polls at the shortest enabled file or API discovery interval.

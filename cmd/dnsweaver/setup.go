@@ -116,7 +116,8 @@ func registerSources(registry *source.Registry, cfg *config.Config, logger *slog
 			}
 			logger.Info("registered source",
 				slog.String("name", name),
-				slog.Bool("file_discovery", src.SupportsDiscovery()),
+				slog.Bool("file_discovery", src.FileConfig().IsEnabled()),
+				slog.Bool("api_discovery", src.SupportsAPIDiscovery()),
 			)
 		case "dnsweaver":
 			src := dnsweaversource.New(dnsweaversource.WithLogger(logger))
@@ -264,7 +265,8 @@ func incusEndpoint(cfg *config.Config) string {
 	return "unix:" + cfg.IncusSocketPath()
 }
 
-// createTraefikSource creates a Traefik label parser with optional file discovery.
+// createTraefikSource creates a Traefik label parser with optional file and
+// API discovery.
 func createTraefikSource(cfg *config.Config, logger *slog.Logger) *traefik.Traefik {
 	opts := []traefik.Option{
 		traefik.WithLogger(logger),
@@ -277,6 +279,22 @@ func createTraefikSource(cfg *config.Config, logger *slog.Logger) *traefik.Traef
 		logger.Debug("traefik file discovery configured",
 			slog.Any("paths", srcCfg.FileDiscovery.FilePaths),
 			slog.String("pattern", srcCfg.FileDiscovery.FilePattern),
+		)
+	}
+
+	if srcCfg != nil && srcCfg.API.IsEnabled() {
+		opts = append(opts, traefik.WithAPIDiscovery(traefik.APIDiscoveryConfig{
+			URL:              srcCfg.API.URL,
+			Username:         srcCfg.API.Username,
+			Password:         srcCfg.API.Password,
+			ExcludeProviders: srcCfg.API.ExcludeProviders,
+			TLSSkipVerify:    srcCfg.API.TLSSkipVerify,
+		}))
+		logger.Debug("traefik api discovery configured",
+			slog.String("url", srcCfg.API.URL),
+			slog.Bool("basic_auth", srcCfg.API.Username != "" || srcCfg.API.Password != ""),
+			slog.Any("exclude_providers", srcCfg.API.ExcludeProviders),
+			slog.Duration("poll_interval", srcCfg.API.PollInterval),
 		)
 	}
 

@@ -2,7 +2,9 @@
 package config
 
 import (
+	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"time"
 
@@ -106,6 +108,7 @@ func convertFileSources(fileSources []FileSourceConfig) *SourceConfig {
 		inst := &SourceInstanceConfig{
 			Name:          fs.Name,
 			FileDiscovery: source.DefaultFileDiscoveryConfig(),
+			API:           defaultTraefikAPIConfig(),
 		}
 
 		if fs.FileDiscovery != nil {
@@ -121,6 +124,10 @@ func convertFileSources(fileSources []FileSourceConfig) *SourceConfig {
 			if fs.FileDiscovery.WatchMethod != "" {
 				inst.FileDiscovery.WatchMethod = strings.ToLower(fs.FileDiscovery.WatchMethod)
 			}
+		}
+
+		if fs.API != nil {
+			applyFileTraefikAPI(&inst.API, fs.API)
 		}
 
 		applySourceEnv(inst)
@@ -139,4 +146,29 @@ func mergeGlobalConfig(base *GlobalConfig) (*GlobalConfig, []*ConfigError) {
 	cfg := *base
 	errs := applyGlobalEnv(&cfg)
 	return &cfg, errs
+}
+
+// applyFileTraefikAPI copies YAML Traefik API settings onto cfg. Environment
+// overrides are applied afterwards by applySourceEnv.
+func applyFileTraefikAPI(cfg *TraefikAPIConfig, f *FileTraefikAPIConfig) {
+	cfg.URL = strings.TrimSpace(f.URL)
+	cfg.Username = f.Username
+	cfg.Password = f.Password
+	if f.PasswordFile != "" {
+		content, err := os.ReadFile(f.PasswordFile)
+		if err != nil {
+			cfg.secretErr = fmt.Errorf("reading traefik api password_file %q: %w", f.PasswordFile, err)
+		} else {
+			cfg.Password = strings.TrimSpace(string(content))
+		}
+	}
+	if f.ExcludeProviders != nil {
+		cfg.ExcludeProviders = append([]string{}, f.ExcludeProviders...)
+	}
+	cfg.TLSSkipVerify = f.TLSSkipVerify
+	if f.PollInterval != "" {
+		if interval, err := time.ParseDuration(f.PollInterval); err == nil && interval >= time.Second {
+			cfg.PollInterval = interval
+		}
+	}
 }

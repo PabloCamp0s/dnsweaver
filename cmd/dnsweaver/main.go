@@ -537,10 +537,19 @@ func run() error {
 		)
 	}
 
-	// Initialize file watcher for sources with file discovery (#22)
+	// Initialize the discovery poller for sources with file discovery (#22)
+	// or Traefik API discovery. The poll interval is the shortest configured
+	// interval among enabled discovery settings.
 	var fileWatcher *source.FileWatcher
-	if cfg.HasFileDiscovery() {
-		logger.Info("file discovery enabled, starting file watcher")
+	if cfg.HasDiscovery() {
+		watcherOpts := []source.FileWatcherOption{source.WithWatcherLogger(logger)}
+		pollInterval := cfg.DiscoveryPollInterval()
+		if pollInterval > 0 {
+			watcherOpts = append(watcherOpts, source.WithPollInterval(pollInterval))
+		}
+		logger.Info("discovery enabled, starting discovery poller",
+			slog.Duration("poll_interval", pollInterval),
+		)
 		fileWatcher = source.NewFileWatcher(sourceRegistry,
 			func(sourceName string, hostnames []source.Hostname) {
 				logger.Info("file watcher detected changes",
@@ -549,7 +558,7 @@ func run() error {
 				)
 				triggerReconcile()
 			},
-			source.WithWatcherLogger(logger),
+			watcherOpts...,
 		)
 	}
 

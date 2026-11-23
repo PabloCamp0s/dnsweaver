@@ -2,6 +2,7 @@ package config
 
 import (
 	"log/slog"
+	"os"
 	"strings"
 	"time"
 
@@ -23,6 +24,51 @@ type SourceInstanceConfig struct {
 	// Traefik's `entryPoints.<name>.asDefault = true` configuration.
 	// See sources/traefik.WithDefaultEntryPoints. Ignored for non-traefik sources.
 	DefaultEntryPoints []string
+
+	// API contains Traefik REST API discovery configuration.
+	// Presence of URL implies enablement. Only valid for the traefik source.
+	API TraefikAPIConfig
+}
+
+// DefaultTraefikAPIPollInterval is how often the Traefik API is polled when
+// API discovery is enabled and no interval is configured.
+const DefaultTraefikAPIPollInterval = 30 * time.Second
+
+// TraefikAPIConfig holds configuration for discovering routers through the
+// Traefik REST API (GET /api/http/routers).
+type TraefikAPIConfig struct {
+	// URL is the base URL of the Traefik API (e.g. http://127.0.0.1:8080).
+	// Empty means API discovery is disabled.
+	URL string
+
+	// Username and Password enable HTTP basic authentication.
+	Username string
+	Password string
+
+	// ExcludeProviders lists Traefik providers whose routers are ignored.
+	// nil means the source default ("internal"); an empty non-nil slice
+	// excludes nothing.
+	ExcludeProviders []string
+
+	// TLSSkipVerify disables certificate verification for HTTPS URLs.
+	TLSSkipVerify bool
+
+	// PollInterval is how often the API is queried for changes.
+	PollInterval time.Duration
+
+	// secretErr records a failure reading the password from a file so that
+	// validation can report it instead of silently running unauthenticated.
+	secretErr error
+}
+
+// IsEnabled returns true if Traefik API discovery is configured.
+func (c TraefikAPIConfig) IsEnabled() bool {
+	return c.URL != ""
+}
+
+// defaultTraefikAPIConfig returns the API config defaults.
+func defaultTraefikAPIConfig() TraefikAPIConfig {
+	return TraefikAPIConfig{PollInterval: DefaultTraefikAPIPollInterval}
 }
 
 // SourceConfig holds all source configuration.
@@ -72,6 +118,7 @@ func parseSources() []string {
 //	DNSWEAVER_SOURCE_TRAEFIK_FILE_PATTERN=*.yml,*.yaml
 //	DNSWEAVER_SOURCE_TRAEFIK_POLL_INTERVAL=30s
 //	DNSWEAVER_SOURCE_TRAEFIK_WATCH_METHOD=auto
+//	DNSWEAVER_SOURCE_TRAEFIK_API_URL=http://127.0.0.1:8080
 func loadSourceConfig() *SourceConfig {
 	names := parseSources()
 
@@ -99,6 +146,7 @@ func loadSourceInstanceConfig(name string) *SourceInstanceConfig {
 	cfg := &SourceInstanceConfig{
 		Name:          name,
 		FileDiscovery: source.DefaultFileDiscoveryConfig(),
+		API:           defaultTraefikAPIConfig(),
 	}
 
 	applySourceEnv(cfg)
@@ -155,6 +203,47 @@ func applySourceEnv(cfg *SourceInstanceConfig) {
 		}
 		cfg.DefaultEntryPoints = out
 	}
+
+	applySourceAPIEnv(cfg, prefix)
+}
+
+// applySourceAPIEnv applies the API_* environment overrides. These are only
+// meaningful for the traefik source; validation rejects them elsewhere.
+//
+//	API_URL               base URL of the Traefik API (enables API discovery)
+//	API_USERNAME          basic auth user
+//	API_PASSWORD(_FILE)   basic auth password, or a file containing it
+//	API_EXCLUDE_PROVIDERS comma-separated providers to ignore (default: internal;
+//	                      set to an empty value to include every provider)
+//	API_TLS_SKIP_VERIFY   skip TLS certificate verification
+//	API_POLL_INTERVAL     how often to query the API (default: 30s, minimum 1s)
+func applySourceAPIEnv(cfg *SourceInstanceConfig, prefix string) {
+	if v := getEnv(prefix + "API_URL"); v != "" {
+		cfg.API.URL = strings.TrimSpace(v)
+	}
+	if v := getEnv(prefix + "API_USERNAME"); v != "" {
+		cfg.API.Username = v
+	}
+	if password, configured, err := getEnvWithFileFallback(prefix, "API_PASSWORD"); err != nil {
+		cfg.API.secretErr = err
+	} else if configured {
+		cfg.API.Password = password
+	}
+	if v, ok := os.LookupEnv(prefix + "API_EXCLUDE_PROVIDERS"); ok {
+		providers := splitCommaList(v)
+		if providers == nil {
+			providers = []string{}
+		}
+		cfg.API.ExcludeProviders = providers
+	}
+	if v := getEnv(prefix + "API_TLS_SKIP_VERIFY"); v != "" {
+		cfg.API.TLSSkipVerify = parseBool(v, false)
+	}
+	if v := getEnv(prefix + "API_POLL_INTERVAL"); v != "" {
+		if interval, err := time.ParseDuration(v); err == nil && interval >= time.Second {
+			cfg.API.PollInterval = interval
+		}
+	}
 }
 
 // GetSourceInstance returns the configuration for a specific source by name.
@@ -175,4 +264,41 @@ func (c *SourceConfig) HasFileDiscovery() bool {
 		}
 	}
 	return false
+}
+
+// HasAPIDiscovery returns true if any source has Traefik API discovery configured.
+func (c *SourceConfig) HasAPIDiscovery() bool {
+	for _, inst := range c.Instances {
+		if inst.API.IsEnabled() {
+			return true
+		}
+	}
+	return false
+}
+
+// HasDiscovery returns true if any source needs periodic discovery polling
+// (file discovery or Traefik API discovery).
+func (c *SourceConfig) HasDiscovery() bool {
+	return c.HasFileDiscovery() || c.HasAPIDiscovery()
+}
+
+// DiscoveryPollInterval returns the polling interval for periodic discovery:
+// the shortest configured interval among enabled file and API discovery
+// settings. Returns 0 if no discovery is enabled.
+func (c *SourceConfig) DiscoveryPollInterval() time.Duration {
+	var shortest time.Duration
+	consider := func(d time.Duration) {
+		if d > 0 && (shortest == 0 || d < shortest) {
+			shortest = d
+		}
+	}
+	for _, inst := range c.Instances {
+		if inst.FileDiscovery.IsEnabled() {
+			consider(inst.FileDiscovery.PollInterval)
+		}
+		if inst.API.IsEnabled() {
+			consider(inst.API.PollInterval)
+		}
+	}
+	return shortest
 }

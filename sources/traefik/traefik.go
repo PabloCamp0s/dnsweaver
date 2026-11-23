@@ -2,7 +2,8 @@
 // from Traefik reverse proxy labels and static configuration files.
 //
 // This package parses Docker container labels in the format used by Traefik v2/v3
-// to configure HTTP routers, as well as static YAML/TOML configuration files.
+// to configure HTTP routers, static YAML/TOML configuration files, and the
+// routers Traefik reports through its REST API (GET /api/http/routers).
 //
 // Example labels:
 //
@@ -20,8 +21,10 @@ package traefik
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 
+	"github.com/maxfield-allison/dnsweaver/pkg/httputil"
 	"github.com/maxfield-allison/dnsweaver/pkg/source"
 	"github.com/maxfield-allison/dnsweaver/pkg/workload"
 )
@@ -38,6 +41,9 @@ type Traefik struct {
 	parser             *Parser
 	logger             *slog.Logger
 	fileConfig         source.FileDiscoveryConfig
+	apiConfig          APIDiscoveryConfig
+	api                *apiClient
+	apiErr             error // invalid API configuration, reported by Discover
 	defaultEntryPoints []string
 }
 
@@ -59,6 +65,14 @@ func WithFileDiscovery(config source.FileDiscoveryConfig) Option {
 		if t.fileConfig.FilePattern == "" {
 			t.fileConfig.FilePattern = DefaultFilePattern
 		}
+	}
+}
+
+// WithAPIDiscovery configures discovery from the Traefik REST API.
+// Discovery is enabled when config.URL is non-empty.
+func WithAPIDiscovery(config APIDiscoveryConfig) Option {
+	return func(t *Traefik) {
+		t.apiConfig = config
 	}
 }
 
@@ -94,6 +108,22 @@ func New(opts ...Option) *Traefik {
 		parserOpts = append(parserOpts, WithParserDefaultEntryPoints(t.defaultEntryPoints))
 	}
 	t.parser = NewParser(parserOpts...)
+
+	if t.apiConfig.IsEnabled() {
+		httpClient := t.apiConfig.HTTPClient
+		if httpClient == nil {
+			timeout := t.apiConfig.Timeout
+			if timeout <= 0 {
+				timeout = DefaultAPITimeout
+			}
+			httpClient = httputil.NewClient(&httputil.ClientConfig{
+				Timeout:       timeout,
+				TLSSkipVerify: t.apiConfig.TLSSkipVerify,
+				Logger:        t.logger,
+			})
+		}
+		t.api, t.apiErr = newAPIClient(t.apiConfig, httpClient)
+	}
 
 	return t
 }
@@ -137,31 +167,64 @@ func (t *Traefik) Extract(ctx context.Context, w workload.Workload) ([]source.Ho
 	return hostnames, nil
 }
 
-// Discover finds hostnames from configured Traefik static configuration files.
+// Discover finds hostnames from Traefik static configuration files and/or
+// the Traefik REST API, whichever are configured.
 //
-// This method parses Traefik YAML/TOML files for http.routers.*.rule entries,
-// extracting Host() patterns. It ONLY parses router rules - middleware files,
-// service definitions, and other config sections are safely ignored.
+// File discovery parses YAML/TOML files for http.routers.*.rule entries; it
+// ONLY parses router rules - middleware files, service definitions, and other
+// config sections are safely ignored. API discovery reads the routers Traefik
+// actually built (GET /api/http/routers), which includes routers generated
+// from a provider's defaultRule.
 //
-// Returns nil, nil if file discovery is not configured for this source.
+// If either configured method fails, Discover returns an error and no
+// hostnames, so the reconciler treats the snapshot as incomplete and keeps
+// existing records instead of deleting them.
+//
+// Returns nil, nil if neither discovery method is configured.
 func (t *Traefik) Discover(ctx context.Context) ([]source.Hostname, error) {
 	if !t.SupportsDiscovery() {
 		return nil, nil
 	}
 
-	t.logger.Debug("discovering hostnames from traefik files",
-		slog.Any("paths", t.fileConfig.FilePaths),
-		slog.String("pattern", t.fileConfig.FilePattern),
-	)
+	var extractions []HostnameExtraction
 
-	hostnames, err := t.parser.DiscoverFromFiles(ctx, t.fileConfig.FilePaths, t.fileConfig.FilePattern)
-	if err != nil {
-		return nil, err
+	if t.fileConfig.IsEnabled() {
+		t.logger.Debug("discovering hostnames from traefik files",
+			slog.Any("paths", t.fileConfig.FilePaths),
+			slog.String("pattern", t.fileConfig.FilePattern),
+		)
+		fromFiles, err := t.parser.DiscoverFromFiles(ctx, t.fileConfig.FilePaths, t.fileConfig.FilePattern)
+		if err != nil {
+			return nil, err
+		}
+		extractions = append(extractions, fromFiles...)
 	}
 
-	// Convert to source.Hostname
-	result := make([]source.Hostname, 0, len(hostnames))
-	for _, e := range hostnames {
+	if t.apiConfig.IsEnabled() {
+		if t.apiErr != nil {
+			return nil, fmt.Errorf("traefik api discovery misconfigured: %w", t.apiErr)
+		}
+		fromAPI, err := t.parser.DiscoverFromAPI(ctx, t.api)
+		if err != nil {
+			return nil, err
+		}
+		extractions = append(extractions, fromAPI...)
+	}
+
+	// Convert to source.Hostname, deduplicating (hostname, entrypoint) pairs
+	// that both files and the API report.
+	type seenKey struct {
+		hostname   string
+		entrypoint string
+	}
+	seen := make(map[seenKey]struct{}, len(extractions))
+	result := make([]source.Hostname, 0, len(extractions))
+	for _, e := range extractions {
+		k := seenKey{hostname: e.Hostname, entrypoint: e.EntryPoint}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
 		result = append(result, source.Hostname{
 			Name:     e.Hostname,
 			Source:   sourceName,
@@ -171,7 +234,7 @@ func (t *Traefik) Discover(ctx context.Context) ([]source.Hostname, error) {
 	}
 
 	if len(result) > 0 {
-		t.logger.Debug("discovered hostnames from traefik files",
+		t.logger.Debug("discovered hostnames from traefik files/api",
 			slog.Int("count", len(result)),
 		)
 	}
@@ -179,9 +242,14 @@ func (t *Traefik) Discover(ctx context.Context) ([]source.Hostname, error) {
 	return result, nil
 }
 
-// SupportsDiscovery returns true if file paths are configured.
+// SupportsDiscovery returns true if file paths or an API URL are configured.
 func (t *Traefik) SupportsDiscovery() bool {
-	return t.fileConfig.IsEnabled()
+	return t.fileConfig.IsEnabled() || t.apiConfig.IsEnabled()
+}
+
+// SupportsAPIDiscovery returns true if an API URL is configured.
+func (t *Traefik) SupportsAPIDiscovery() bool {
+	return t.apiConfig.IsEnabled()
 }
 
 // SupportedPlatforms returns an empty slice, meaning Traefik source works with

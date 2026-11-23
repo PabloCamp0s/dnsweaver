@@ -100,6 +100,13 @@ sources:
       pattern: "*.yml"
       poll_interval: 60s
       watch_method: auto  # auto, inotify, or poll
+    # Optional: discover the routers Traefik actually built (incl. defaultRule)
+    # api:
+    #   url: http://127.0.0.1:8080
+    #   poll_interval: 30s
+    #   username: dnsweaver
+    #   password: ${TRAEFIK_API_PASSWORD}
+    #   exclude_providers: [internal]   # [] includes every provider
 
   # Native dnsweaver labels (no additional config needed)
   - name: dnsweaver

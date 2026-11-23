@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"regexp"
 	"strings"
 
@@ -90,6 +91,63 @@ func validateConfig(cfg *Config) []*ConfigError {
 	// Validate domain patterns for each provider
 	for _, inst := range cfg.ProviderInstances {
 		errs = append(errs, validateDomainPatterns(inst)...)
+	}
+
+	// Validate Traefik API discovery settings for each source
+	if cfg.Sources != nil {
+		for _, inst := range cfg.Sources.Instances {
+			errs = append(errs, validateSourceAPI(inst)...)
+		}
+	}
+
+	return errs
+}
+
+// validateSourceAPI checks Traefik API discovery settings. API discovery is
+// only implemented for the traefik source, the URL must be an absolute
+// http(s) URL, and credentials belong in USERNAME/PASSWORD rather than the
+// URL so they are never logged.
+func validateSourceAPI(inst *SourceInstanceConfig) []*ConfigError {
+	field := sourceEnvPrefix(inst.Name) + "API_URL"
+	var errs []*ConfigError
+
+	if inst.API.secretErr != nil {
+		errs = append(errs, configErrHelp(
+			sourceEnvPrefix(inst.Name)+"API_PASSWORD",
+			inst.API.secretErr.Error(),
+			"Check that the password file exists and is readable",
+		))
+	}
+
+	if !inst.API.IsEnabled() {
+		return errs
+	}
+
+	if inst.Name != "traefik" {
+		return append(errs, configErrHelp(
+			field,
+			fmt.Sprintf("API discovery is not supported for source %q", inst.Name),
+			"API discovery is only available for the traefik source",
+		))
+	}
+
+	u, err := url.Parse(inst.API.URL)
+	switch {
+	case err != nil:
+		errs = append(errs, configErrFull(field, fmt.Sprintf("invalid URL: %v", err),
+			"Use the base URL of the Traefik API", "http://127.0.0.1:8080"))
+	case u.Scheme != "http" && u.Scheme != "https":
+		errs = append(errs, configErrFull(field, fmt.Sprintf("unsupported scheme %q", u.Scheme),
+			"The Traefik API URL must start with http:// or https://", "http://127.0.0.1:8080"))
+	case u.Host == "":
+		errs = append(errs, configErrFull(field, "URL has no host",
+			"Use the base URL of the Traefik API", "http://127.0.0.1:8080"))
+	case u.User != nil:
+		errs = append(errs, configErrHelp(field, "URL must not contain credentials",
+			"Set "+sourceEnvPrefix(inst.Name)+"API_USERNAME and API_PASSWORD instead"))
+	case u.RawQuery != "" || u.Fragment != "":
+		errs = append(errs, configErrFull(field, "URL must not contain a query or fragment",
+			"Use the base URL of the Traefik API", "http://127.0.0.1:8080"))
 	}
 
 	return errs

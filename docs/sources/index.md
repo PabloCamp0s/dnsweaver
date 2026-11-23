@@ -36,6 +36,14 @@ dnsweaver reads hostnames from seven **sources**. All seven are peers: enable an
 
     [:octicons-arrow-right-24: Traefik Files](traefik-files.md)
 
+-   :material-api:{ .lg .middle } **Traefik API**
+
+    ---
+
+    Read the routers Traefik actually built, including `defaultRule` routers for unlabeled containers.
+
+    [:octicons-arrow-right-24: Traefik API](traefik-api.md)
+
 -   :material-rocket-launch:{ .lg .middle } **Caddy Labels**
 
     ---
@@ -94,7 +102,7 @@ When multiple sources provide the same hostname, dnsweaver uses the following pr
 2. `traefik` labels (reverse proxy configuration)
 3. `caddy` labels (caddy-docker-proxy configuration)
 4. `nginx-proxy` labels (`VIRTUAL_HOST`)
-5. `traefik` files (dynamic configuration)
+5. `traefik` files and API (dynamic configuration, routers reported by Traefik)
 6. `kubernetes` (resource spec hostnames)
 7. `proxmox` (VM/LXC name + domain suffix)
 8. `incus` (instance name + domain suffix)
@@ -108,7 +116,7 @@ The value in the first column is what you put in `DNSWEAVER_SOURCES`.
 
 | Source | Reads | Runs over | Example |
 | :----- | :---- | :-------- | :------ |
-| `traefik` | `traefik.http.routers.*.rule` labels, plus `http.routers.*.rule` in Traefik dynamic config files | Docker, Swarm, Incus | `` Host(`app.example.com`) `` |
+| `traefik` | `traefik.http.routers.*.rule` labels, plus `http.routers.*.rule` in Traefik dynamic config files and routers from the Traefik API | Docker, Swarm, Incus | `` Host(`app.example.com`) `` |
 | `caddy` | `caddy` / `caddy_<n>` labels from caddy-docker-proxy | Docker, Swarm, Incus | `caddy=app.example.com` |
 | `nginx-proxy` | `VIRTUAL_HOST` labels from jwilder/nginx-proxy | Docker, Swarm, Incus | `VIRTUAL_HOST=app.example.com` |
 | `dnsweaver` | Native `dnsweaver.*` labels, for explicit record configuration | Docker, Swarm, Incus | `dnsweaver.hostname=app.example.com` |
@@ -121,7 +129,8 @@ The four label-reading sources also work on Incus, because the Incus adapter sur
 stripped `<key>` form. No extra configuration needed.
 
 Traefik file discovery is part of the `traefik` source, not a separate entry: set
-`DNSWEAVER_SOURCE_TRAEFIK_FILE_PATHS` and it turns on.
+`DNSWEAVER_SOURCE_TRAEFIK_FILE_PATHS` and it turns on. Traefik API discovery works the
+same way: set `DNSWEAVER_SOURCE_TRAEFIK_API_URL`.
 
 !!! info "Multiple hostnames"
     Containers and Kubernetes resources can expose multiple hostnames. All discovered hostnames are processed independently and matched against configured provider domains.

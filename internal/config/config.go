@@ -564,6 +564,21 @@ func (c *Config) HasFileDiscovery() bool {
 	return c.Sources != nil && c.Sources.HasFileDiscovery()
 }
 
+// HasDiscovery returns true if any source needs periodic discovery polling
+// (file discovery or Traefik API discovery).
+func (c *Config) HasDiscovery() bool {
+	return c.Sources != nil && c.Sources.HasDiscovery()
+}
+
+// DiscoveryPollInterval returns the shortest configured discovery polling
+// interval, or 0 if no discovery is enabled.
+func (c *Config) DiscoveryPollInterval() time.Duration {
+	if c.Sources == nil {
+		return 0
+	}
+	return c.Sources.DiscoveryPollInterval()
+}
+
 // String returns a summary of the configuration (without secrets).
 func (c *Config) String() string {
 	sourceNames := "[]"

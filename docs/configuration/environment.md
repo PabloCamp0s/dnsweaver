@@ -81,7 +81,7 @@ Set `DNSWEAVER_PLATFORM` to control which workload sources are active:
 - **`docker`** — Watch Docker containers/services only (default, backward-compatible)
 - **`kubernetes`** — Watch Kubernetes Ingress/IngressRoute/HTTPRoute/Service resources only
 - **`both`** — Watch both Docker and Kubernetes workloads simultaneously
-- **`none`** (alias: `standalone`) — Create no container-runtime client. Use this to run dnsweaver as a bare binary on a host, VM, or LXC where there is no Docker or Kubernetes. You must configure at least one non-container source: a Proxmox VE source (`DNSWEAVER_PROXMOX_URL`), an Incus source (`DNSWEAVER_INCUS_URL` / `DNSWEAVER_INCUS_SOCKET_PATH`), or a file-discovery source (e.g. `DNSWEAVER_SOURCE_TRAEFIK_FILE_PATHS`). Startup will fail if `none` is set and no such source is configured.
+- **`none`** (alias: `standalone`) — Create no container-runtime client. Use this to run dnsweaver as a bare binary on a host, VM, or LXC where there is no Docker or Kubernetes. You must configure at least one non-container source: a Proxmox VE source (`DNSWEAVER_PROXMOX_URL`), an Incus source (`DNSWEAVER_INCUS_URL` / `DNSWEAVER_INCUS_SOCKET_PATH`), or a file-discovery source (e.g. `DNSWEAVER_SOURCE_TRAEFIK_FILE_PATHS`), or Traefik API discovery (`DNSWEAVER_SOURCE_TRAEFIK_API_URL`). Startup will fail if `none` is set and no such source is configured.
 
 ### Standalone (no Docker or Kubernetes)
 
@@ -301,6 +301,21 @@ world-readable inside the container, a real downgrade):
 | `DNSWEAVER_SOURCE_TRAEFIK_POLL_INTERVAL` | `60s` | File re-scan interval |
 | `DNSWEAVER_SOURCE_TRAEFIK_WATCH_METHOD` | `auto` | Watch method: `auto`, `inotify`, `poll` |
 | `DNSWEAVER_SOURCE_TRAEFIK_DEFAULT_ENTRYPOINTS` | *(none)* | Comma-separated entrypoints to assign to Traefik routers that declare none. Mirrors Traefik's [`asDefault`](https://doc.traefik.io/traefik/reference/install-configuration/entrypoints/#opt-asdefault) setting; required if you flag any entrypoint `asDefault = true` in Traefik so unlabeled routers don't become wildcards in dnsweaver. See [Traefik `asDefault` Entrypoints](../sources/swarm.md#traefik-asdefault-entrypoints). |
+
+### Traefik API Source Settings
+
+See [Traefik API](../sources/traefik-api.md) for details.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DNSWEAVER_SOURCE_TRAEFIK_API_URL` | *(none)* | Base URL of the Traefik API (e.g. `http://127.0.0.1:8080`). Enables API discovery. |
+| `DNSWEAVER_SOURCE_TRAEFIK_API_USERNAME` | *(none)* | HTTP basic auth user |
+| `DNSWEAVER_SOURCE_TRAEFIK_API_PASSWORD` | *(none)* | HTTP basic auth password (`_FILE` supported) |
+| `DNSWEAVER_SOURCE_TRAEFIK_API_EXCLUDE_PROVIDERS` | `internal` | Comma-separated Traefik providers to ignore; empty value includes every provider |
+| `DNSWEAVER_SOURCE_TRAEFIK_API_TLS_SKIP_VERIFY` | `false` | Skip TLS verification for an `https://` API URL |
+| `DNSWEAVER_SOURCE_TRAEFIK_API_POLL_INTERVAL` | `30s` | API polling interval (minimum `1s`) |
+
+When both file and API discovery are enabled, dnsweaver polls at the shorter of the two intervals.
 
 ### Proxmox VE Source Settings
 

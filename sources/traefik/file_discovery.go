@@ -199,45 +199,62 @@ func (p *Parser) extractFromConfig(config *traefikFileConfig, path string) ([]Ho
 		if router.Rule == "" {
 			continue
 		}
-
-		hosts := extractHostsFromRule(router.Rule)
-		eps := router.EntryPoints
-		// If router declared no entrypoints and the source was configured
-		// with DefaultEntryPoints (Traefik `asDefault` mirror), fan out across
-		// those defaults instead of treating the router as wildcard.
-		if len(eps) == 0 && len(p.defaultEntryPoints) > 0 {
-			eps = p.defaultEntryPoints
-		}
-		for _, hostname := range hosts {
-			if len(eps) == 0 {
-				extractions = append(extractions, HostnameExtraction{
-					Hostname: hostname,
-					Router:   routerName,
-				})
-				p.logger.Debug("extracted hostname from file",
-					"hostname", hostname,
-					"router", routerName,
-					"file", path,
-				)
-				continue
-			}
-			for _, ep := range eps {
-				extractions = append(extractions, HostnameExtraction{
-					Hostname:   hostname,
-					Router:     routerName,
-					EntryPoint: ep,
-				})
-				p.logger.Debug("extracted hostname from file",
-					"hostname", hostname,
-					"router", routerName,
-					"entrypoint", ep,
-					"file", path,
-				)
-			}
-		}
+		extractions = append(extractions,
+			p.extractRouter(routerName, router.Rule, router.EntryPoints, "file", path)...)
 	}
 
 	return extractions, nil
+}
+
+// extractRouter turns one router (name, rule, declared entrypoints) into
+// hostname extractions. It is shared by file and API discovery so both apply
+// identical entrypoint semantics.
+//
+// Routers that declare entrypoints fan out into one extraction per
+// (host, entrypoint) pair. Routers that declare none use the configured
+// DefaultEntryPoints (Traefik `asDefault` mirror) when set, and otherwise
+// produce a single wildcard extraction with EntryPoint="".
+//
+// originKey/originValue identify where the router came from in debug logs
+// (e.g. "file", "/rules/app.yml" or "api", "http://traefik:8080").
+func (p *Parser) extractRouter(routerName, rule string, eps []string, originKey, originValue string) []HostnameExtraction {
+	hosts := extractHostsFromRule(rule)
+	if len(hosts) == 0 {
+		return nil
+	}
+	if len(eps) == 0 && len(p.defaultEntryPoints) > 0 {
+		eps = p.defaultEntryPoints
+	}
+
+	var extractions []HostnameExtraction
+	for _, hostname := range hosts {
+		if len(eps) == 0 {
+			extractions = append(extractions, HostnameExtraction{
+				Hostname: hostname,
+				Router:   routerName,
+			})
+			p.logger.Debug("extracted hostname from traefik router",
+				"hostname", hostname,
+				"router", routerName,
+				originKey, originValue,
+			)
+			continue
+		}
+		for _, ep := range eps {
+			extractions = append(extractions, HostnameExtraction{
+				Hostname:   hostname,
+				Router:     routerName,
+				EntryPoint: ep,
+			})
+			p.logger.Debug("extracted hostname from traefik router",
+				"hostname", hostname,
+				"router", routerName,
+				"entrypoint", ep,
+				originKey, originValue,
+			)
+		}
+	}
+	return extractions
 }
 
 // traefikFileConfig represents the structure of Traefik config files.

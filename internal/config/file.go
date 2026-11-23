@@ -96,6 +96,18 @@ type FileKubernetesConfig struct {
 type FileSourceConfig struct {
 	Name          string                   `yaml:"name"`                     // traefik, caddy, dnsweaver, etc.
 	FileDiscovery *FileFileDiscoveryConfig `yaml:"file_discovery,omitempty"` // Optional file discovery settings
+	API           *FileTraefikAPIConfig    `yaml:"api,omitempty"`            // Optional Traefik API discovery (traefik only)
+}
+
+// FileTraefikAPIConfig holds Traefik REST API discovery settings.
+type FileTraefikAPIConfig struct {
+	URL              string   `yaml:"url,omitempty"`               // Base URL of the Traefik API
+	Username         string   `yaml:"username,omitempty"`          // Basic auth user
+	Password         string   `yaml:"password,omitempty"`          // Basic auth password (supports ${VAR})
+	PasswordFile     string   `yaml:"password_file,omitempty"`     // File containing the basic auth password
+	ExcludeProviders []string `yaml:"exclude_providers,omitempty"` // Providers to ignore (default: internal; [] = none)
+	TLSSkipVerify    bool     `yaml:"tls_skip_verify,omitempty"`   // Skip TLS certificate verification
+	PollInterval     string   `yaml:"poll_interval,omitempty"`     // How often to query the API (default: 30s)
 }
 
 // FileFileDiscoveryConfig holds file-based discovery settings.
@@ -200,6 +212,17 @@ func (c *FileConfig) interpolateEnvVars() {
 			fd.Pattern = InterpolateEnvVars(fd.Pattern)
 			fd.PollInterval = InterpolateEnvVars(fd.PollInterval)
 			fd.WatchMethod = InterpolateEnvVars(fd.WatchMethod)
+		}
+		if c.Sources[i].API != nil {
+			api := c.Sources[i].API
+			api.URL = InterpolateEnvVars(api.URL)
+			api.Username = InterpolateEnvVars(api.Username)
+			api.Password = InterpolateEnvVars(api.Password)
+			api.PasswordFile = InterpolateEnvVars(api.PasswordFile)
+			api.PollInterval = InterpolateEnvVars(api.PollInterval)
+			for j := range api.ExcludeProviders {
+				api.ExcludeProviders[j] = InterpolateEnvVars(api.ExcludeProviders[j])
+			}
 		}
 	}
 
