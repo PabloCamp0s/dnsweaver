@@ -41,6 +41,7 @@ sources:
       # password: ${TRAEFIK_API_PASSWORD}   # or password_file: /run/secrets/traefik_api
       # exclude_providers: [internal]       # default; [] includes every provider
       # tls_skip_verify: false
+      # drop_grace: 5m                      # hold suspicious router drops; "0" disables
 ```
 
 API discovery can be combined with label parsing and with
@@ -57,6 +58,7 @@ are deduplicated.
 | `DNSWEAVER_SOURCE_TRAEFIK_API_EXCLUDE_PROVIDERS` | `exclude_providers` | `internal` | Comma-separated Traefik providers whose routers are ignored. Set it to an empty value (`[]` in YAML) to include every provider. |
 | `DNSWEAVER_SOURCE_TRAEFIK_API_TLS_SKIP_VERIFY` | `tls_skip_verify` | `false` | Skip certificate verification for an `https://` API URL |
 | `DNSWEAVER_SOURCE_TRAEFIK_API_POLL_INTERVAL` | `poll_interval` | `30s` | How often the API is queried (minimum `1s`) |
+| `DNSWEAVER_SOURCE_TRAEFIK_API_DROP_GRACE` | `drop_grace` | `5m` | How long a suspicious drop in the router list is held back before hostnames may be removed (see [Failure handling](#failure-handling)). `0` disables the guard. |
 
 Credentials must not be embedded in the URL; use the username and password
 settings so they are never logged.
@@ -98,11 +100,33 @@ Traefik's API has no change stream, so dnsweaver combines two triggers:
 
 ## Failure handling
 
-If the API is unreachable, returns a non-200 status, or returns a body that is
-not a router list, discovery fails for that cycle. The reconciler then treats
-its view as incomplete and **does not delete any records**; it resumes normal
-operation once the API answers again. A paginated listing is only used when
-every page was fetched successfully.
+An API answer is not proof that the router list is complete, so dnsweaver
+treats three situations separately.
+
+**The API fails.** If it is unreachable, returns a non-200 status, or returns
+a body that is not a router list, discovery fails for that cycle. The
+reconciler treats its view as incomplete and **does not delete any records**
+until the API answers again.
+
+**The list is torn by pagination.** dnsweaver requests the whole list in one
+page (`per_page=1000`; Traefik does not cap it), so a router added or removed
+while reading cannot shift page boundaries. If the server still paginates, the
+full list is read again until two consecutive reads agree; if it keeps
+changing, discovery fails for that cycle as above.
+
+**The API answers, but routers are missing.** Right after a Traefik restart,
+the API can answer while a provider (typically Docker) has not loaded its
+routers yet. dnsweaver remembers the last accepted list, and if a provider that
+had routers no longer reports any, or the list shrinks by more than half (from
+at least 5 routers), it keeps publishing the previous routers alongside the new
+ones for `drop_grace` (default 5 minutes). New routers are still published
+immediately. If the drop is still there when the grace period ends, it is
+accepted as real and the missing hostnames are removed.
+
+The grace period is a trade-off, not a guarantee: a provider outage longer than
+`drop_grace` is indistinguishable from every workload of that provider being
+removed. Raise it if your Traefik restarts or provider outages can last longer,
+or set `0` to disable the guard.
 
 ## Reaching the API
 

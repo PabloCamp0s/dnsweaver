@@ -283,18 +283,25 @@ func createTraefikSource(cfg *config.Config, logger *slog.Logger) *traefik.Traef
 	}
 
 	if srcCfg != nil && srcCfg.API.IsEnabled() {
+		// config: 0 disables the drop guard; traefik: 0 means default, <0 disables.
+		dropGrace := srcCfg.API.DropGrace
+		if dropGrace == 0 {
+			dropGrace = -1
+		}
 		opts = append(opts, traefik.WithAPIDiscovery(traefik.APIDiscoveryConfig{
 			URL:              srcCfg.API.URL,
 			Username:         srcCfg.API.Username,
 			Password:         srcCfg.API.Password,
 			ExcludeProviders: srcCfg.API.ExcludeProviders,
 			TLSSkipVerify:    srcCfg.API.TLSSkipVerify,
+			DropGrace:        dropGrace,
 		}))
 		logger.Debug("traefik api discovery configured",
 			slog.String("url", srcCfg.API.URL),
 			slog.Bool("basic_auth", srcCfg.API.Username != "" || srcCfg.API.Password != ""),
 			slog.Any("exclude_providers", srcCfg.API.ExcludeProviders),
 			slog.Duration("poll_interval", srcCfg.API.PollInterval),
+			slog.Duration("drop_grace", srcCfg.API.DropGrace),
 		)
 	}
 

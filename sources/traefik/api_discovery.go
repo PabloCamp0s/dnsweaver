@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/maxfield-allison/dnsweaver/pkg/httputil"
@@ -22,10 +25,25 @@ var DefaultAPIExcludeProviders = []string{"internal"}
 // DefaultAPITimeout bounds a single request to the Traefik API.
 const DefaultAPITimeout = 10 * time.Second
 
-// apiPageSize is the page size requested from the Traefik API. Traefik caps
-// per_page server-side; 100 keeps the number of round trips low without
-// relying on a larger cap.
-const apiPageSize = 100
+// DefaultAPIDropGrace is how long a suspicious drop in the router list (a
+// provider vanishing, or the list shrinking by more than half) is held back
+// before it is accepted as real. See APIDiscoveryConfig.DropGrace.
+const DefaultAPIDropGrace = 5 * time.Minute
+
+// apiPageSize is the page size requested from the Traefik API. Traefik does
+// not cap per_page, so a large page returns the whole router list in a single
+// response for practically every deployment. A single response cannot be torn
+// by routers changing between pages.
+const apiPageSize = 1000
+
+// apiConsistentReads bounds how many extra full reads are attempted when the
+// router list spans several pages and changes between reads.
+const apiConsistentReads = 3
+
+// apiDropMinRouters is the minimum size of the previously accepted router
+// list for a "shrank by more than half" drop to count as suspicious. Small
+// lists legitimately halve when one or two containers stop.
+const apiDropMinRouters = 5
 
 // apiMaxPages guards against a misbehaving server that keeps advertising a
 // next page. 1000 pages of 100 routers is far beyond any real deployment.
@@ -66,6 +84,16 @@ type APIDiscoveryConfig struct {
 	// Timeout bounds each request. Zero means DefaultAPITimeout.
 	Timeout time.Duration
 
+	// DropGrace guards against snapshots that Traefik reports successfully but
+	// that are incomplete, e.g. while a provider is still starting after a
+	// Traefik restart. When a provider that previously had routers vanishes,
+	// or the router list shrinks by more than half, the previous routers are
+	// kept (merged with the new ones) until the drop has persisted for
+	// DropGrace; only then are their hostnames allowed to be removed. New
+	// routers are still published immediately. Zero means DefaultAPIDropGrace;
+	// a negative value disables the guard.
+	DropGrace time.Duration
+
 	// HTTPClient overrides the client used for requests (tests only).
 	HTTPClient *http.Client
 }
@@ -95,9 +123,18 @@ type apiClient struct {
 	password   string
 	exclude    map[string]struct{}
 	http       *http.Client
+	logger     *slog.Logger
+	dropGrace  time.Duration
+	now        func() time.Time
+
+	// Drop guard state: the last router list accepted as complete, and when
+	// the current suspicious drop was first seen (zero if none).
+	mu        sync.Mutex
+	accepted  []apiRouter
+	holdSince time.Time
 }
 
-func newAPIClient(cfg APIDiscoveryConfig, httpClient *http.Client) (*apiClient, error) {
+func newAPIClient(cfg APIDiscoveryConfig, httpClient *http.Client, logger *slog.Logger) (*apiClient, error) {
 	base, err := url.Parse(strings.TrimSpace(cfg.URL))
 	if err != nil {
 		return nil, fmt.Errorf("parsing traefik api url: %w", err)
@@ -120,12 +157,23 @@ func newAPIClient(cfg APIDiscoveryConfig, httpClient *http.Client) (*apiClient, 
 		}
 	}
 
+	dropGrace := cfg.DropGrace
+	if dropGrace == 0 {
+		dropGrace = DefaultAPIDropGrace
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+
 	return &apiClient{
 		routersURL: base.JoinPath("api", "http", "routers"),
 		username:   cfg.Username,
 		password:   cfg.Password,
 		exclude:    excludeSet,
 		http:       httpClient,
+		logger:     logger,
+		dropGrace:  dropGrace,
+		now:        time.Now,
 	}, nil
 }
 
@@ -136,23 +184,178 @@ func (c *apiClient) endpoint() string {
 	return u.String()
 }
 
-// fetchRouters returns every HTTP router, following Traefik's X-Next-Page
-// pagination. Any transport, status or decoding error aborts discovery so the
-// caller reports an incomplete snapshot instead of a partial one.
+// fetchRouters returns every HTTP router. Any transport, status or decoding
+// error aborts discovery so the caller reports an incomplete snapshot instead
+// of a partial one.
+//
+// The list is normally returned in one page. If it spans several pages, a
+// router added or removed between page requests can shift the page boundaries
+// and make a successful read miss an active router, so the full list is read
+// again until two consecutive reads agree.
 func (c *apiClient) fetchRouters(ctx context.Context) ([]apiRouter, error) {
-	var all []apiRouter
-	for page := 1; page <= apiMaxPages; {
-		routers, next, err := c.fetchPage(ctx, page)
+	routers, pages, err := c.fetchAllPages(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if pages == 1 {
+		return routers, nil
+	}
+	for attempt := 0; attempt < apiConsistentReads; attempt++ {
+		again, _, err := c.fetchAllPages(ctx)
 		if err != nil {
 			return nil, err
 		}
+		if routerListsEqual(routers, again) {
+			return again, nil
+		}
+		routers = again
+	}
+	return nil, fmt.Errorf("traefik api router list changed between paginated reads %d times in a row", apiConsistentReads)
+}
+
+// fetchAllPages reads every page once, following Traefik's X-Next-Page header.
+func (c *apiClient) fetchAllPages(ctx context.Context) ([]apiRouter, int, error) {
+	var all []apiRouter
+	pages := 0
+	for page := 1; page <= apiMaxPages; {
+		routers, next, err := c.fetchPage(ctx, page)
+		if err != nil {
+			return nil, 0, err
+		}
+		pages++
 		all = append(all, routers...)
 		if next <= page {
-			return all, nil
+			return all, pages, nil
 		}
 		page = next
 	}
-	return nil, fmt.Errorf("traefik api pagination exceeded %d pages", apiMaxPages)
+	return nil, 0, fmt.Errorf("traefik api pagination exceeded %d pages", apiMaxPages)
+}
+
+// routerListsEqual reports whether two reads returned the same routers with
+// the same hostname-relevant fields, ignoring order.
+func routerListsEqual(a, b []apiRouter) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	ka, kb := routerKeys(a), routerKeys(b)
+	for i := range ka {
+		if ka[i] != kb[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func routerKeys(rs []apiRouter) []string {
+	keys := make([]string, 0, len(rs))
+	for _, r := range rs {
+		keys = append(keys, strings.Join([]string{
+			r.Name, r.Provider, r.Status, r.Rule,
+			strings.Join(r.Using, ","), strings.Join(r.EntryPoints, ","),
+		}, "\x00"))
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// stabilize applies the drop guard to the routers that passed filtering.
+//
+// Traefik can answer successfully with an incomplete router list, for example
+// right after a restart while its Docker provider is not yet available. If the
+// list looks like that (a provider that had routers is gone, or the list
+// shrank by more than half), the previously accepted routers are merged back
+// in so their hostnames are not removed, while new routers are still
+// published. The drop is accepted once it has persisted for dropGrace.
+func (c *apiClient) stabilize(current []apiRouter) []apiRouter {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.dropGrace < 0 || c.accepted == nil {
+		c.accept(current)
+		return current
+	}
+
+	reason := suspiciousDrop(c.accepted, current)
+	if reason == "" {
+		if !c.holdSince.IsZero() {
+			c.logger.Info("traefik api router list recovered; drop guard released",
+				"endpoint", c.endpoint())
+		}
+		c.accept(current)
+		return current
+	}
+
+	now := c.now()
+	if c.holdSince.IsZero() {
+		c.holdSince = now
+		c.logger.Warn("traefik api router list dropped suspiciously; keeping previous hostnames",
+			"endpoint", c.endpoint(),
+			"reason", reason,
+			"grace", c.dropGrace.String(),
+		)
+	}
+	if held := now.Sub(c.holdSince); held >= c.dropGrace {
+		c.logger.Warn("traefik api router drop persisted past grace period; accepting it",
+			"endpoint", c.endpoint(),
+			"reason", reason,
+			"held", held.Round(time.Second).String(),
+		)
+		c.accept(current)
+		return current
+	}
+	return mergeRouters(c.accepted, current)
+}
+
+// accept records current as the last complete router list. Callers hold c.mu.
+func (c *apiClient) accept(current []apiRouter) {
+	c.accepted = append([]apiRouter{}, current...)
+	c.holdSince = time.Time{}
+}
+
+// suspiciousDrop explains why current looks like an incomplete version of
+// previous, or returns "" if it does not.
+func suspiciousDrop(previous, current []apiRouter) string {
+	prevByProvider := countByProvider(previous)
+	curByProvider := countByProvider(current)
+	var vanished []string
+	for provider, n := range prevByProvider {
+		if n > 0 && curByProvider[provider] == 0 {
+			vanished = append(vanished, provider)
+		}
+	}
+	if len(vanished) > 0 {
+		sort.Strings(vanished)
+		return fmt.Sprintf("provider %s no longer reports any router", strings.Join(vanished, ", "))
+	}
+	if len(previous) >= apiDropMinRouters && len(current)*2 < len(previous) {
+		return fmt.Sprintf("router count dropped from %d to %d", len(previous), len(current))
+	}
+	return ""
+}
+
+func countByProvider(rs []apiRouter) map[string]int {
+	counts := make(map[string]int)
+	for _, r := range rs {
+		counts[strings.ToLower(routerProvider(r))]++
+	}
+	return counts
+}
+
+// mergeRouters returns current plus every previous router whose name is not
+// in current, so held-back hostnames stay published during the grace period.
+func mergeRouters(previous, current []apiRouter) []apiRouter {
+	seen := make(map[string]struct{}, len(current))
+	merged := append([]apiRouter{}, current...)
+	for _, r := range current {
+		seen[r.Name] = struct{}{}
+	}
+	for _, r := range previous {
+		if _, ok := seen[r.Name]; !ok {
+			merged = append(merged, r)
+		}
+	}
+	return merged
 }
 
 func (c *apiClient) fetchPage(ctx context.Context, page int) ([]apiRouter, int, error) {
@@ -224,10 +427,21 @@ func routerProvider(r apiRouter) string {
 // DiscoverFromAPI fetches routers from the Traefik API and extracts hostnames
 // using the same entrypoint semantics as file discovery.
 func (p *Parser) DiscoverFromAPI(ctx context.Context, c *apiClient) ([]HostnameExtraction, error) {
-	routers, err := c.fetchRouters(ctx)
+	fetched, err := c.fetchRouters(ctx)
 	if err != nil {
 		return nil, err
 	}
+
+	var included []apiRouter
+	skipped := 0
+	for _, r := range fetched {
+		if !c.include(r) {
+			skipped++
+			continue
+		}
+		included = append(included, r)
+	}
+	routers := c.stabilize(included)
 
 	type seenKey struct {
 		hostname   string
@@ -235,13 +449,8 @@ func (p *Parser) DiscoverFromAPI(ctx context.Context, c *apiClient) ([]HostnameE
 	}
 	seen := make(map[seenKey]struct{})
 	var extractions []HostnameExtraction
-	skipped := 0
 
 	for _, r := range routers {
-		if !c.include(r) {
-			skipped++
-			continue
-		}
 		eps := r.Using
 		if len(eps) == 0 {
 			eps = r.EntryPoints
@@ -258,8 +467,9 @@ func (p *Parser) DiscoverFromAPI(ctx context.Context, c *apiClient) ([]HostnameE
 
 	p.logger.Debug("fetched traefik routers from api",
 		"endpoint", c.endpoint(),
-		"routers", len(routers),
+		"routers", len(fetched),
 		"skipped", skipped,
+		"published", len(routers),
 		"extractions", len(extractions),
 	)
 	return extractions, nil

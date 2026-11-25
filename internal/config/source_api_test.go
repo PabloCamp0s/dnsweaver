@@ -210,3 +210,37 @@ func TestValidateSourceAPI(t *testing.T) {
 		})
 	}
 }
+
+func TestSourceAPIDropGrace(t *testing.T) {
+	tests := []struct {
+		name string
+		env  string // "" = unset
+		yaml string // "" = unset
+		want time.Duration
+	}{
+		{name: "default", want: DefaultTraefikAPIDropGrace},
+		{name: "env duration", env: "2m", want: 2 * time.Minute},
+		{name: "env zero disables", env: "0", want: 0},
+		{name: "env negative keeps default", env: "-1m", want: DefaultTraefikAPIDropGrace},
+		{name: "env malformed keeps default", env: "soon", want: DefaultTraefikAPIDropGrace},
+		{name: "yaml duration", yaml: "90s", want: 90 * time.Second},
+		{name: "yaml zero disables", yaml: "0s", want: 0},
+		{name: "env overrides yaml", yaml: "90s", env: "10m", want: 10 * time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearAllEnv(t)
+			defer clearAllEnv(t)
+			if tt.env != "" {
+				t.Setenv("DNSWEAVER_SOURCE_TRAEFIK_API_DROP_GRACE", tt.env)
+			}
+			cfg := convertFileSources([]FileSourceConfig{{
+				Name: "traefik",
+				API:  &FileTraefikAPIConfig{URL: "http://traefik:8080", DropGrace: tt.yaml},
+			}})
+			if got := cfg.GetSourceInstance("traefik").API.DropGrace; got != tt.want {
+				t.Fatalf("DropGrace = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
