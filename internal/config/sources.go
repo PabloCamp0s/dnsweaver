@@ -34,6 +34,10 @@ type SourceInstanceConfig struct {
 // API discovery is enabled and no interval is configured.
 const DefaultTraefikAPIPollInterval = 30 * time.Second
 
+// DefaultTraefikAPIStartupSettle is how long Traefik must have been running
+// before its router list is trusted as complete.
+const DefaultTraefikAPIStartupSettle = 60 * time.Second
+
 // DefaultTraefikAPIDropGrace is how long a suspicious drop in the Traefik
 // router list is held back before hostnames may be removed.
 const DefaultTraefikAPIDropGrace = 5 * time.Minute
@@ -65,6 +69,11 @@ type TraefikAPIConfig struct {
 	// hostnames may be removed. Zero disables the guard.
 	DropGrace time.Duration
 
+	// StartupSettle is how long Traefik must have been running (per
+	// /api/version startDate) before its router list is trusted as complete.
+	// Zero disables the guard.
+	StartupSettle time.Duration
+
 	// secretErr records a failure reading the password from a file so that
 	// validation can report it instead of silently running unauthenticated.
 	secretErr error
@@ -77,7 +86,7 @@ func (c TraefikAPIConfig) IsEnabled() bool {
 
 // defaultTraefikAPIConfig returns the API config defaults.
 func defaultTraefikAPIConfig() TraefikAPIConfig {
-	return TraefikAPIConfig{PollInterval: DefaultTraefikAPIPollInterval, DropGrace: DefaultTraefikAPIDropGrace}
+	return TraefikAPIConfig{PollInterval: DefaultTraefikAPIPollInterval, DropGrace: DefaultTraefikAPIDropGrace, StartupSettle: DefaultTraefikAPIStartupSettle}
 }
 
 // SourceConfig holds all source configuration.
@@ -227,6 +236,7 @@ func applySourceEnv(cfg *SourceInstanceConfig) {
 //	API_TLS_SKIP_VERIFY   skip TLS certificate verification
 //	API_POLL_INTERVAL     how often to query the API (default: 30s, minimum 1s)
 //	API_DROP_GRACE        hold suspicious router drops this long (default: 5m; 0 disables)
+//	API_STARTUP_SETTLE    distrust the list until Traefik has run this long (default: 60s; 0 disables)
 func applySourceAPIEnv(cfg *SourceInstanceConfig, prefix string) {
 	if v := getEnv(prefix + "API_URL"); v != "" {
 		cfg.API.URL = strings.TrimSpace(v)
@@ -259,11 +269,16 @@ func applySourceAPIEnv(cfg *SourceInstanceConfig, prefix string) {
 			cfg.API.DropGrace = grace
 		}
 	}
+	if v := getEnv(prefix + "API_STARTUP_SETTLE"); v != "" {
+		if settle, ok := parseDropGrace(v); ok {
+			cfg.API.StartupSettle = settle
+		}
+	}
 }
 
-// parseDropGrace parses a drop grace duration. "0" (or any zero duration)
-// disables the guard; negative or malformed values are rejected so the
-// default is kept.
+// parseDropGrace parses a guard duration (API_DROP_GRACE, API_STARTUP_SETTLE).
+// "0" (or any zero duration) disables the guard; negative or malformed values
+// are rejected so the default is kept.
 func parseDropGrace(v string) (time.Duration, bool) {
 	v = strings.TrimSpace(v)
 	if v == "0" {

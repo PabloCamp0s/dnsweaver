@@ -42,6 +42,7 @@ sources:
       # exclude_providers: [internal]       # default; [] includes every provider
       # tls_skip_verify: false
       # drop_grace: 5m                      # hold suspicious router drops; "0" disables
+      # startup_settle: 60s                 # distrust the list right after a Traefik restart; "0" disables
 ```
 
 API discovery can be combined with label parsing and with
@@ -59,6 +60,7 @@ are deduplicated.
 | `DNSWEAVER_SOURCE_TRAEFIK_API_TLS_SKIP_VERIFY` | `tls_skip_verify` | `false` | Skip certificate verification for an `https://` API URL |
 | `DNSWEAVER_SOURCE_TRAEFIK_API_POLL_INTERVAL` | `poll_interval` | `30s` | How often the API is queried (minimum `1s`) |
 | `DNSWEAVER_SOURCE_TRAEFIK_API_DROP_GRACE` | `drop_grace` | `5m` | How long a suspicious drop in the router list is held back before hostnames may be removed (see [Failure handling](#failure-handling)). `0` disables the guard. |
+| `DNSWEAVER_SOURCE_TRAEFIK_API_STARTUP_SETTLE` | `startup_settle` | `60s` | How long Traefik must have been running (from `/api/version`) before its router list is trusted (see [Failure handling](#failure-handling)). `0` disables the guard. |
 
 Credentials must not be embedded in the URL; use the username and password
 settings so they are never logged.
@@ -114,9 +116,24 @@ while reading cannot shift page boundaries. If the server still paginates, the
 full list is read again until two consecutive reads agree; if it keeps
 changing, discovery fails for that cycle as above.
 
-**The API answers, but routers are missing.** Right after a Traefik restart,
-the API can answer while a provider (typically Docker) has not loaded its
-routers yet. dnsweaver remembers the last accepted list, and if a provider that
+**Traefik has just started.** Right after a Traefik restart, the API can
+answer while a provider (typically Docker) has not loaded its routers yet.
+dnsweaver reads Traefik's start time from `/api/version` and does not trust
+the router list until Traefik has been running for `startup_settle`
+(default 60 seconds):
+
+- If dnsweaver has no previous list (for example both containers were
+  restarted together), discovery fails for those cycles, so nothing is
+  created or removed until Traefik has settled.
+- If Traefik restarts while dnsweaver keeps running, dnsweaver keeps
+  publishing the previous routers alongside the new ones until it settles.
+
+If `/api/version` cannot be read (for example an API restricted to
+`/api/http/routers` only), this guard is skipped and logged once; allow
+`GET /api/version` as well to keep it.
+
+**The API answers, but routers are missing.** dnsweaver also remembers the
+last accepted list, and if a provider that
 had routers no longer reports any, or the list shrinks by more than half (from
 at least 5 routers), it keeps publishing the previous routers alongside the new
 ones for `drop_grace` (default 5 minutes). New routers are still published

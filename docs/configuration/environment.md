@@ -314,6 +314,7 @@ See [Traefik API](../sources/traefik-api.md) for details.
 | `DNSWEAVER_SOURCE_TRAEFIK_API_EXCLUDE_PROVIDERS` | `internal` | Comma-separated Traefik providers to ignore; empty value includes every provider |
 | `DNSWEAVER_SOURCE_TRAEFIK_API_TLS_SKIP_VERIFY` | `false` | Skip TLS verification for an `https://` API URL |
 | `DNSWEAVER_SOURCE_TRAEFIK_API_POLL_INTERVAL` | `30s` | API polling interval (minimum `1s`) |
+| `DNSWEAVER_SOURCE_TRAEFIK_API_STARTUP_SETTLE` | `60s` | Do not trust the router list until Traefik has been running this long (from `/api/version`); `0` disables |
 | `DNSWEAVER_SOURCE_TRAEFIK_API_DROP_GRACE` | `5m` | Hold back a suspicious drop in the router list (provider vanished, or list shrank by more than half) for this long before removing hostnames; `0` disables |
 
 When both file and API discovery are enabled, dnsweaver polls at the shorter of the two intervals.

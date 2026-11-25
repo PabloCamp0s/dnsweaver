@@ -30,11 +30,29 @@ type fakeTraefikAPI struct {
 	password   string
 	status     atomic.Int32 // when non-zero, every request returns this status
 	body       string       // when non-empty, returned verbatim instead of JSON routers
-	requests   atomic.Int32
+	requests   atomic.Int32 // router list requests only
 	lastPath   atomic.Value
+	startDate  time.Time // served by /api/version when non-zero (set under mu)
+}
+
+func (f *fakeTraefikAPI) setStart(t time.Time) {
+	f.mu.Lock()
+	f.startDate = t
+	f.mu.Unlock()
 }
 
 func (f *fakeTraefikAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if strings.HasSuffix(r.URL.Path, "/api/version") {
+		f.mu.Lock()
+		start := f.startDate
+		f.mu.Unlock()
+		if start.IsZero() {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"Version": "3.8.0", "startDate": start})
+		return
+	}
 	f.requests.Add(1)
 	f.lastPath.Store(r.URL.Path)
 
@@ -567,4 +585,115 @@ func TestAPIDiscovery_CombinedWithFiles(t *testing.T) {
 	if hs, err := src.Discover(context.Background()); err == nil || hs != nil {
 		t.Fatalf("expected error and no hostnames when API fails, got %v, %v", hs, err)
 	}
+}
+
+func TestAPIDiscovery_StartupSettle(t *testing.T) {
+	docker := func(names ...string) []apiRouter {
+		var rs []apiRouter
+		for _, n := range names {
+			rs = append(rs, apiRouter{Name: n + "@docker", Provider: "docker", Status: "enabled", Rule: "Host(`" + n + ".example.com`)"})
+		}
+		return rs
+	}
+	file := apiRouter{Name: "static@file", Provider: "file", Status: "enabled", Rule: "Host(`static.example.com`)"}
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	setup := func(t *testing.T, cfg APIDiscoveryConfig) (*fakeTraefikAPI, *Traefik, *time.Time) {
+		t.Helper()
+		api := &fakeTraefikAPI{}
+		src := newAPISource(t, api, cfg)
+		now := t0
+		src.api.now = func() time.Time { return now }
+		return api, src, &now
+	}
+	set := func(api *fakeTraefikAPI, rs []apiRouter) {
+		api.mu.Lock()
+		api.routers = rs
+		api.mu.Unlock()
+	}
+	names := func(t *testing.T, hs []source.Hostname) []string {
+		t.Helper()
+		var got []string
+		for _, h := range hs {
+			got = append(got, strings.TrimSuffix(h.Name, ".example.com"))
+		}
+		sort.Strings(got)
+		return got
+	}
+
+	t.Run("dnsweaver starting with a freshly started traefik waits", func(t *testing.T) {
+		api, src, now := setup(t, APIDiscoveryConfig{})
+		api.setStart(t0.Add(-5 * time.Second))
+		set(api, []apiRouter{file}) // docker provider not loaded yet
+		if hs, err := src.Discover(context.Background()); err == nil || hs != nil || !strings.Contains(err.Error(), "waiting") {
+			t.Fatalf("expected settle error and no hostnames, got %v, %v", hs, err)
+		}
+		*now = t0.Add(30 * time.Second)
+		set(api, append(docker("a", "b"), file))
+		if _, err := src.Discover(context.Background()); err == nil {
+			t.Fatal("still within settle window, expected error")
+		}
+		*now = t0.Add(56 * time.Second) // traefik has now run for 61s
+		hs, err := src.Discover(context.Background())
+		if err != nil {
+			t.Fatalf("Discover after settle: %v", err)
+		}
+		assertStrings(t, names(t, hs), []string{"a", "b", "static"})
+	})
+
+	t.Run("long-running traefik is trusted immediately", func(t *testing.T) {
+		api, src, _ := setup(t, APIDiscoveryConfig{})
+		api.setStart(t0.Add(-24 * time.Hour))
+		set(api, append(docker("a"), file))
+		hs, err := src.Discover(context.Background())
+		if err != nil {
+			t.Fatalf("Discover: %v", err)
+		}
+		assertStrings(t, names(t, hs), []string{"a", "static"})
+	})
+
+	t.Run("traefik restart under a running dnsweaver holds removals", func(t *testing.T) {
+		api, src, now := setup(t, APIDiscoveryConfig{})
+		api.setStart(t0.Add(-24 * time.Hour))
+		set(api, append(docker("a", "b", "c"), file))
+		if _, err := src.Discover(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		// Traefik restarts; docker has loaded only part of its routers. Not
+		// enough to trip the drop guard (2 of 4 left, docker still present).
+		*now = t0.Add(10 * time.Second)
+		api.setStart(t0.Add(5 * time.Second))
+		set(api, append(docker("a", "new"), file))
+		hs, err := src.Discover(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertStrings(t, names(t, hs), []string{"a", "b", "c", "new", "static"})
+		// Settled: the list is trusted again and the removals apply.
+		*now = t0.Add(70 * time.Second)
+		hs, err = src.Discover(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertStrings(t, names(t, hs), []string{"a", "new", "static"})
+	})
+
+	t.Run("version endpoint unavailable skips the guard", func(t *testing.T) {
+		api, src, _ := setup(t, APIDiscoveryConfig{})
+		set(api, []apiRouter{file}) // startDate zero -> /api/version returns 404
+		hs, err := src.Discover(context.Background())
+		if err != nil {
+			t.Fatalf("Discover: %v", err)
+		}
+		assertStrings(t, names(t, hs), []string{"static"})
+	})
+
+	t.Run("guard disabled", func(t *testing.T) {
+		api, src, _ := setup(t, APIDiscoveryConfig{StartupSettle: -1})
+		api.setStart(t0.Add(-time.Second))
+		set(api, []apiRouter{file})
+		if _, err := src.Discover(context.Background()); err != nil {
+			t.Fatalf("Discover with guard disabled: %v", err)
+		}
+	})
 }

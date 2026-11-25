@@ -108,6 +108,7 @@ sources:
     #   password: ${TRAEFIK_API_PASSWORD}
     #   exclude_providers: [internal]   # [] includes every provider
     #   drop_grace: 5m                  # hold suspicious router drops; "0" disables
+    #   startup_settle: 60s             # distrust the list right after a Traefik restart; "0" disables
 
   # Native dnsweaver labels (no additional config needed)
   - name: dnsweaver

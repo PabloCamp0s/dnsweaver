@@ -244,3 +244,33 @@ func TestSourceAPIDropGrace(t *testing.T) {
 		})
 	}
 }
+
+func TestSourceAPIStartupSettle(t *testing.T) {
+	tests := []struct {
+		name, env, yaml string
+		want            time.Duration
+	}{
+		{name: "default", want: DefaultTraefikAPIStartupSettle},
+		{name: "env duration", env: "2m", want: 2 * time.Minute},
+		{name: "env zero disables", env: "0", want: 0},
+		{name: "env negative keeps default", env: "-5s", want: DefaultTraefikAPIStartupSettle},
+		{name: "yaml duration", yaml: "45s", want: 45 * time.Second},
+		{name: "env overrides yaml", yaml: "45s", env: "90s", want: 90 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearAllEnv(t)
+			defer clearAllEnv(t)
+			if tt.env != "" {
+				t.Setenv("DNSWEAVER_SOURCE_TRAEFIK_API_STARTUP_SETTLE", tt.env)
+			}
+			cfg := convertFileSources([]FileSourceConfig{{
+				Name: "traefik",
+				API:  &FileTraefikAPIConfig{URL: "http://traefik:8080", StartupSettle: tt.yaml},
+			}})
+			if got := cfg.GetSourceInstance("traefik").API.StartupSettle; got != tt.want {
+				t.Fatalf("StartupSettle = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

@@ -176,4 +176,9 @@ func applyFileTraefikAPI(cfg *TraefikAPIConfig, f *FileTraefikAPIConfig) {
 			cfg.DropGrace = grace
 		}
 	}
+	if f.StartupSettle != "" {
+		if settle, ok := parseDropGrace(f.StartupSettle); ok {
+			cfg.StartupSettle = settle
+		}
+	}
 }
