@@ -171,4 +171,9 @@ func applyFileTraefikAPI(cfg *TraefikAPIConfig, f *FileTraefikAPIConfig) {
 			cfg.PollInterval = interval
 		}
 	}
+	if f.DropGrace != "" {
+		if grace, ok := parseDropGrace(f.DropGrace); ok {
+			cfg.DropGrace = grace
+		}
+	}
 }

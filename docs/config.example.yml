@@ -107,6 +107,7 @@ sources:
     #   username: dnsweaver
     #   password: ${TRAEFIK_API_PASSWORD}
     #   exclude_providers: [internal]   # [] includes every provider
+    #   drop_grace: 5m                  # hold suspicious router drops; "0" disables
 
   # Native dnsweaver labels (no additional config needed)
   - name: dnsweaver

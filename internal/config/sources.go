@@ -34,6 +34,10 @@ type SourceInstanceConfig struct {
 // API discovery is enabled and no interval is configured.
 const DefaultTraefikAPIPollInterval = 30 * time.Second
 
+// DefaultTraefikAPIDropGrace is how long a suspicious drop in the Traefik
+// router list is held back before hostnames may be removed.
+const DefaultTraefikAPIDropGrace = 5 * time.Minute
+
 // TraefikAPIConfig holds configuration for discovering routers through the
 // Traefik REST API (GET /api/http/routers).
 type TraefikAPIConfig struct {
@@ -56,6 +60,11 @@ type TraefikAPIConfig struct {
 	// PollInterval is how often the API is queried for changes.
 	PollInterval time.Duration
 
+	// DropGrace is how long a suspicious drop in the router list (a provider
+	// vanishing, or the list shrinking by more than half) is held back before
+	// hostnames may be removed. Zero disables the guard.
+	DropGrace time.Duration
+
 	// secretErr records a failure reading the password from a file so that
 	// validation can report it instead of silently running unauthenticated.
 	secretErr error
@@ -68,7 +77,7 @@ func (c TraefikAPIConfig) IsEnabled() bool {
 
 // defaultTraefikAPIConfig returns the API config defaults.
 func defaultTraefikAPIConfig() TraefikAPIConfig {
-	return TraefikAPIConfig{PollInterval: DefaultTraefikAPIPollInterval}
+	return TraefikAPIConfig{PollInterval: DefaultTraefikAPIPollInterval, DropGrace: DefaultTraefikAPIDropGrace}
 }
 
 // SourceConfig holds all source configuration.
@@ -217,6 +226,7 @@ func applySourceEnv(cfg *SourceInstanceConfig) {
 //	                      set to an empty value to include every provider)
 //	API_TLS_SKIP_VERIFY   skip TLS certificate verification
 //	API_POLL_INTERVAL     how often to query the API (default: 30s, minimum 1s)
+//	API_DROP_GRACE        hold suspicious router drops this long (default: 5m; 0 disables)
 func applySourceAPIEnv(cfg *SourceInstanceConfig, prefix string) {
 	if v := getEnv(prefix + "API_URL"); v != "" {
 		cfg.API.URL = strings.TrimSpace(v)
@@ -244,6 +254,26 @@ func applySourceAPIEnv(cfg *SourceInstanceConfig, prefix string) {
 			cfg.API.PollInterval = interval
 		}
 	}
+	if v := getEnv(prefix + "API_DROP_GRACE"); v != "" {
+		if grace, ok := parseDropGrace(v); ok {
+			cfg.API.DropGrace = grace
+		}
+	}
+}
+
+// parseDropGrace parses a drop grace duration. "0" (or any zero duration)
+// disables the guard; negative or malformed values are rejected so the
+// default is kept.
+func parseDropGrace(v string) (time.Duration, bool) {
+	v = strings.TrimSpace(v)
+	if v == "0" {
+		return 0, true
+	}
+	grace, err := time.ParseDuration(v)
+	if err != nil || grace < 0 {
+		return 0, false
+	}
+	return grace, true
 }
 
 // GetSourceInstance returns the configuration for a specific source by name.

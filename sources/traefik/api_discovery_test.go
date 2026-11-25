@@ -10,8 +10,10 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/maxfield-allison/dnsweaver/pkg/source"
 )
@@ -20,13 +22,16 @@ import (
 // given routers with the requested per_page and an X-Next-Page header (Traefik
 // sends X-Next-Page: 1 on the last page).
 type fakeTraefikAPI struct {
-	routers  []apiRouter
-	username string
-	password string
-	status   atomic.Int32 // when non-zero, every request returns this status
-	body     string       // when non-empty, returned verbatim instead of JSON routers
-	requests atomic.Int32
-	lastPath atomic.Value
+	mu         sync.Mutex
+	routers    []apiRouter
+	maxPerPage int            // when non-zero, caps per_page like a server-side limit
+	beforePage func(page int) // called (under mu) before serving each page
+	username   string
+	password   string
+	status     atomic.Int32 // when non-zero, every request returns this status
+	body       string       // when non-empty, returned verbatim instead of JSON routers
+	requests   atomic.Int32
+	lastPath   atomic.Value
 }
 
 func (f *fakeTraefikAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -53,13 +58,21 @@ func (f *fakeTraefikAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	perPage, _ := strconv.Atoi(r.URL.Query().Get("per_page"))
 	if perPage <= 0 {
 		perPage = 100
 	}
+	if f.maxPerPage > 0 && perPage > f.maxPerPage {
+		perPage = f.maxPerPage
+	}
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	if page <= 0 {
 		page = 1
+	}
+	if f.beforePage != nil {
+		f.beforePage(page)
 	}
 	start := (page - 1) * perPage
 	end := start + perPage
@@ -258,18 +271,191 @@ func TestAPIDiscovery_Pagination(t *testing.T) {
 			Rule:     "Host(`h" + strconv.Itoa(i) + ".example.com`)",
 		})
 	}
-	api := &fakeTraefikAPI{routers: routers}
-	src := newAPISource(t, api, APIDiscoveryConfig{})
+	t.Run("single large page", func(t *testing.T) {
+		api := &fakeTraefikAPI{routers: routers}
+		src := newAPISource(t, api, APIDiscoveryConfig{})
+		hs, err := src.Discover(context.Background())
+		if err != nil {
+			t.Fatalf("Discover: %v", err)
+		}
+		if len(hs) != 250 {
+			t.Fatalf("got %d hostnames, want 250", len(hs))
+		}
+		if got := api.requests.Load(); got != 1 {
+			t.Fatalf("made %d requests, want 1 (per_page=%d)", got, apiPageSize)
+		}
+	})
 
-	hs, err := src.Discover(context.Background())
-	if err != nil {
-		t.Fatalf("Discover: %v", err)
+	t.Run("server-capped pages are read twice for consistency", func(t *testing.T) {
+		api := &fakeTraefikAPI{routers: routers, maxPerPage: 100}
+		src := newAPISource(t, api, APIDiscoveryConfig{})
+		hs, err := src.Discover(context.Background())
+		if err != nil {
+			t.Fatalf("Discover: %v", err)
+		}
+		if len(hs) != 250 {
+			t.Fatalf("got %d hostnames across pages, want 250", len(hs))
+		}
+		if got := api.requests.Load(); got != 6 {
+			t.Fatalf("made %d requests, want 6 (3 pages, read twice)", got)
+		}
+	})
+}
+
+// A router added between page requests shifts the page boundaries, so a
+// single successful read can miss an active router. Reads are repeated until
+// two consecutive reads agree.
+func TestAPIDiscovery_PaginationTornRead(t *testing.T) {
+	base := func(n int) []apiRouter {
+		var rs []apiRouter
+		for i := 0; i < n; i++ {
+			rs = append(rs, apiRouter{Name: "r" + strconv.Itoa(i) + "@docker", Provider: "docker", Status: "enabled",
+				Rule: "Host(`h" + strconv.Itoa(i) + ".example.com`)"})
+		}
+		return rs
 	}
-	if len(hs) != 250 {
-		t.Fatalf("got %d hostnames across pages, want 250", len(hs))
+
+	t.Run("change between reads settles", func(t *testing.T) {
+		api := &fakeTraefikAPI{routers: base(4), maxPerPage: 2}
+		reads := 0
+		api.beforePage = func(page int) {
+			if page == 2 {
+				reads++
+				if reads == 1 {
+					// Prepend a router while the first read is in progress:
+					// page 2 now repeats r1 and the original last router is
+					// pushed out of the pages already planned.
+					api.routers = append([]apiRouter{{Name: "new@docker", Provider: "docker", Status: "enabled",
+						Rule: "Host(`new.example.com`)"}}, api.routers...)
+				}
+			}
+		}
+		src := newAPISource(t, api, APIDiscoveryConfig{})
+		hs, err := src.Discover(context.Background())
+		if err != nil {
+			t.Fatalf("Discover: %v", err)
+		}
+		got := hostEntrypoints(hs)
+		assertStrings(t, got, []string{"h0.example.com|", "h1.example.com|", "h2.example.com|", "h3.example.com|", "new.example.com|"})
+	})
+
+	t.Run("list that never settles fails discovery", func(t *testing.T) {
+		api := &fakeTraefikAPI{routers: base(4), maxPerPage: 2}
+		n := 0
+		api.beforePage = func(page int) {
+			if page == 1 {
+				n++
+				api.routers = append(api.routers, apiRouter{Name: "churn" + strconv.Itoa(n) + "@docker", Provider: "docker",
+					Status: "enabled", Rule: "Host(`churn" + strconv.Itoa(n) + ".example.com`)"})
+			}
+		}
+		src := newAPISource(t, api, APIDiscoveryConfig{})
+		if hs, err := src.Discover(context.Background()); err == nil || hs != nil {
+			t.Fatalf("expected an error and no hostnames, got %v, %v", hs, err)
+		}
+	})
+}
+
+func TestAPIDiscovery_DropGuard(t *testing.T) {
+	docker := func(names ...string) []apiRouter {
+		var rs []apiRouter
+		for _, n := range names {
+			rs = append(rs, apiRouter{Name: n + "@docker", Provider: "docker", Status: "enabled", Rule: "Host(`" + n + ".example.com`)"})
+		}
+		return rs
 	}
-	if got := api.requests.Load(); got != 3 {
-		t.Fatalf("made %d requests, want 3 pages", got)
+	file := apiRouter{Name: "static@file", Provider: "file", Status: "enabled", Rule: "Host(`static.example.com`)"}
+
+	type step struct {
+		advance time.Duration
+		routers []apiRouter
+		want    []string
+	}
+	tests := []struct {
+		name  string
+		grace time.Duration
+		steps []step
+	}{
+		{
+			name: "vanished provider is held, then accepted after grace",
+			steps: []step{
+				{routers: append(docker("a", "b"), file), want: []string{"a", "b", "static"}},
+				// Traefik restarted: file routers are back, docker ones not yet.
+				{advance: time.Minute, routers: []apiRouter{file}, want: []string{"a", "b", "static"}},
+				{advance: 3 * time.Minute, routers: []apiRouter{file}, want: []string{"a", "b", "static"}},
+				// Still gone after the 5m grace: accepted as real.
+				{advance: 2 * time.Minute, routers: []apiRouter{file}, want: []string{"static"}},
+			},
+		},
+		{
+			name: "provider comes back within grace",
+			steps: []step{
+				{routers: append(docker("a", "b"), file), want: []string{"a", "b", "static"}},
+				{advance: 10 * time.Second, routers: []apiRouter{file}, want: []string{"a", "b", "static"}},
+				// Docker provider is back but "b" was really removed meanwhile.
+				{advance: 10 * time.Second, routers: append(docker("a"), file), want: []string{"a", "static"}},
+				// Guard released: a later genuine removal applies immediately.
+				{advance: 10 * time.Second, routers: []apiRouter{file, docker("c")[0]}, want: []string{"c", "static"}},
+			},
+		},
+		{
+			name: "new routers are published while holding",
+			steps: []step{
+				{routers: append(docker("a"), file), want: []string{"a", "static"}},
+				{advance: time.Second, routers: []apiRouter{file, {Name: "n@file", Provider: "file", Status: "enabled", Rule: "Host(`n.example.com`)"}},
+					want: []string{"a", "n", "static"}},
+			},
+		},
+		{
+			name: "large shrink within a provider is held",
+			steps: []step{
+				{routers: docker("a", "b", "c", "d", "e", "f"), want: []string{"a", "b", "c", "d", "e", "f"}},
+				{advance: time.Second, routers: docker("a", "b"), want: []string{"a", "b", "c", "d", "e", "f"}},
+			},
+		},
+		{
+			name: "small or partial changes apply immediately",
+			steps: []step{
+				{routers: docker("a", "b", "c"), want: []string{"a", "b", "c"}},
+				{advance: time.Second, routers: docker("a"), want: []string{"a"}},
+				{advance: time.Second, routers: docker("a", "b", "c", "d", "e", "f"), want: []string{"a", "b", "c", "d", "e", "f"}},
+				{advance: time.Second, routers: docker("a", "b", "c", "d"), want: []string{"a", "b", "c", "d"}},
+			},
+		},
+		{
+			name:  "guard disabled",
+			grace: -1,
+			steps: []step{
+				{routers: append(docker("a"), file), want: []string{"a", "static"}},
+				{advance: time.Second, routers: []apiRouter{file}, want: []string{"static"}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			api := &fakeTraefikAPI{}
+			src := newAPISource(t, api, APIDiscoveryConfig{DropGrace: tt.grace})
+			now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+			src.api.now = func() time.Time { return now }
+
+			for i, s := range tt.steps {
+				now = now.Add(s.advance)
+				api.mu.Lock()
+				api.routers = s.routers
+				api.mu.Unlock()
+				hs, err := src.Discover(context.Background())
+				if err != nil {
+					t.Fatalf("step %d: Discover: %v", i, err)
+				}
+				var got []string
+				for _, h := range hs {
+					got = append(got, strings.TrimSuffix(h.Name, ".example.com"))
+				}
+				sort.Strings(got)
+				assertStrings(t, got, s.want)
+			}
+		})
 	}
 }
 

@@ -122,7 +122,7 @@ func New(opts ...Option) *Traefik {
 				Logger:        t.logger,
 			})
 		}
-		t.api, t.apiErr = newAPIClient(t.apiConfig, httpClient)
+		t.api, t.apiErr = newAPIClient(t.apiConfig, httpClient, t.logger)
 	}
 
 	return t
