@@ -109,6 +109,7 @@ type FileTraefikAPIConfig struct {
 	TLSSkipVerify    bool     `yaml:"tls_skip_verify,omitempty"`   // Skip TLS certificate verification
 	PollInterval     string   `yaml:"poll_interval,omitempty"`     // How often to query the API (default: 30s)
 	DropGrace        string   `yaml:"drop_grace,omitempty"`        // Hold suspicious router drops (default: 5m; "0" disables)
+	StartupSettle    string   `yaml:"startup_settle,omitempty"`    // Distrust the list until Traefik has run this long (default: 60s; "0" disables)
 }
 
 // FileFileDiscoveryConfig holds file-based discovery settings.
@@ -222,6 +223,7 @@ func (c *FileConfig) interpolateEnvVars() {
 			api.PasswordFile = InterpolateEnvVars(api.PasswordFile)
 			api.PollInterval = InterpolateEnvVars(api.PollInterval)
 			api.DropGrace = InterpolateEnvVars(api.DropGrace)
+			api.StartupSettle = InterpolateEnvVars(api.StartupSettle)
 			for j := range api.ExcludeProviders {
 				api.ExcludeProviders[j] = InterpolateEnvVars(api.ExcludeProviders[j])
 			}

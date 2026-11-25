@@ -288,6 +288,10 @@ func createTraefikSource(cfg *config.Config, logger *slog.Logger) *traefik.Traef
 		if dropGrace == 0 {
 			dropGrace = -1
 		}
+		startupSettle := srcCfg.API.StartupSettle
+		if startupSettle == 0 {
+			startupSettle = -1
+		}
 		opts = append(opts, traefik.WithAPIDiscovery(traefik.APIDiscoveryConfig{
 			URL:              srcCfg.API.URL,
 			Username:         srcCfg.API.Username,
@@ -295,6 +299,7 @@ func createTraefikSource(cfg *config.Config, logger *slog.Logger) *traefik.Traef
 			ExcludeProviders: srcCfg.API.ExcludeProviders,
 			TLSSkipVerify:    srcCfg.API.TLSSkipVerify,
 			DropGrace:        dropGrace,
+			StartupSettle:    startupSettle,
 		}))
 		logger.Debug("traefik api discovery configured",
 			slog.String("url", srcCfg.API.URL),
@@ -302,6 +307,7 @@ func createTraefikSource(cfg *config.Config, logger *slog.Logger) *traefik.Traef
 			slog.Any("exclude_providers", srcCfg.API.ExcludeProviders),
 			slog.Duration("poll_interval", srcCfg.API.PollInterval),
 			slog.Duration("drop_grace", srcCfg.API.DropGrace),
+			slog.Duration("startup_settle", srcCfg.API.StartupSettle),
 		)
 	}
 

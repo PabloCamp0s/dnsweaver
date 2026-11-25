@@ -30,6 +30,10 @@ const DefaultAPITimeout = 10 * time.Second
 // before it is accepted as real. See APIDiscoveryConfig.DropGrace.
 const DefaultAPIDropGrace = 5 * time.Minute
 
+// DefaultAPIStartupSettle is how long Traefik must have been running before
+// its router list is trusted as complete. See APIDiscoveryConfig.StartupSettle.
+const DefaultAPIStartupSettle = 60 * time.Second
+
 // apiPageSize is the page size requested from the Traefik API. Traefik does
 // not cap per_page, so a large page returns the whole router list in a single
 // response for practically every deployment. A single response cannot be torn
@@ -94,6 +98,17 @@ type APIDiscoveryConfig struct {
 	// a negative value disables the guard.
 	DropGrace time.Duration
 
+	// StartupSettle guards against Traefik restarts. Traefik reports its start
+	// time in /api/version; until it has been running for StartupSettle, its
+	// providers may still be loading routers. If dnsweaver has no accepted
+	// router list yet (it started at the same time as Traefik), discovery
+	// fails for the cycle so nothing is created or removed. If Traefik
+	// restarted while dnsweaver was running, the previous routers are kept
+	// merged with the new ones until it settles. When /api/version cannot be
+	// read, this guard is skipped. Zero means DefaultAPIStartupSettle; a
+	// negative value disables the guard.
+	StartupSettle time.Duration
+
 	// HTTPClient overrides the client used for requests (tests only).
 	HTTPClient *http.Client
 }
@@ -125,13 +140,20 @@ type apiClient struct {
 	http       *http.Client
 	logger     *slog.Logger
 	dropGrace  time.Duration
+	settle     time.Duration
+	versionURL *url.URL
 	now        func() time.Time
 
 	// Drop guard state: the last router list accepted as complete, and when
 	// the current suspicious drop was first seen (zero if none).
-	mu        sync.Mutex
-	accepted  []apiRouter
-	holdSince time.Time
+	mu            sync.Mutex
+	accepted      []apiRouter
+	acceptedStart time.Time // Traefik start time when accepted was taken (zero if unknown)
+	holdSince     time.Time
+
+	// Startup guard logging state, so repeated polls do not repeat warnings.
+	versionUnavailableLogged bool
+	restartLoggedFor         time.Time
 }
 
 func newAPIClient(cfg APIDiscoveryConfig, httpClient *http.Client, logger *slog.Logger) (*apiClient, error) {
@@ -161,18 +183,24 @@ func newAPIClient(cfg APIDiscoveryConfig, httpClient *http.Client, logger *slog.
 	if dropGrace == 0 {
 		dropGrace = DefaultAPIDropGrace
 	}
+	settle := cfg.StartupSettle
+	if settle == 0 {
+		settle = DefaultAPIStartupSettle
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 
 	return &apiClient{
 		routersURL: base.JoinPath("api", "http", "routers"),
+		versionURL: base.JoinPath("api", "version"),
 		username:   cfg.Username,
 		password:   cfg.Password,
 		exclude:    excludeSet,
 		http:       httpClient,
 		logger:     logger,
 		dropGrace:  dropGrace,
+		settle:     settle,
 		now:        time.Now,
 	}, nil
 }
@@ -259,21 +287,105 @@ func routerKeys(rs []apiRouter) []string {
 	return keys
 }
 
-// stabilize applies the drop guard to the routers that passed filtering.
+// traefikStart returns when Traefik started, from GET /api/version. known is
+// false when the startup guard is disabled or the endpoint cannot be read (for
+// example an API restricted to /api/http/routers), in which case discovery
+// proceeds without the guard.
+func (c *apiClient) traefikStart(ctx context.Context) (start time.Time, known bool) {
+	if c.settle < 0 {
+		return time.Time{}, false
+	}
+	start, err := c.fetchStartDate(ctx)
+	if err != nil || start.IsZero() {
+		c.mu.Lock()
+		if !c.versionUnavailableLogged {
+			c.versionUnavailableLogged = true
+			c.logger.Info("traefik start time unavailable; startup guard disabled",
+				"endpoint", c.endpoint(), "error", fmt.Sprint(err))
+		}
+		c.mu.Unlock()
+		return time.Time{}, false
+	}
+	return start, true
+}
+
+func (c *apiClient) fetchStartDate(ctx context.Context) (time.Time, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.versionURL.String(), nil)
+	if err != nil {
+		return time.Time{}, err
+	}
+	req.Header.Set("Accept", "application/json")
+	if c.username != "" || c.password != "" {
+		req.SetBasicAuth(c.username, c.password)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return time.Time{}, httputil.RedactRequestError(err, c.password)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return time.Time{}, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	body, err := httputil.ReadBody(resp, 64*1024)
+	if err != nil {
+		return time.Time{}, err
+	}
+	var v struct {
+		StartDate time.Time `json:"startDate"`
+	}
+	if err := json.Unmarshal(body, &v); err != nil {
+		return time.Time{}, err
+	}
+	return v.StartDate, nil
+}
+
+// stabilize applies the startup and drop guards to the routers that passed
+// filtering, and returns the routers whose hostnames should be published.
 //
 // Traefik can answer successfully with an incomplete router list, for example
-// right after a restart while its Docker provider is not yet available. If the
-// list looks like that (a provider that had routers is gone, or the list
-// shrank by more than half), the previously accepted routers are merged back
-// in so their hostnames are not removed, while new routers are still
-// published. The drop is accepted once it has persisted for dropGrace.
-func (c *apiClient) stabilize(current []apiRouter) []apiRouter {
+// right after a restart while its Docker provider is not yet available:
+//
+//   - Startup guard: while Traefik has been running for less than settle, its
+//     list is not trusted. Without a previously accepted list (dnsweaver
+//     started together with Traefik) an error is returned so the cycle is
+//     treated as incomplete; with one (Traefik restarted under a running
+//     dnsweaver), the previous routers are merged back in.
+//   - Drop guard: if the list looks incomplete (a provider that had routers is
+//     gone, or the list shrank by more than half), the previous routers are
+//     merged back in until the drop has persisted for dropGrace.
+//
+// While merging, new routers are still published; only removals are held.
+func (c *apiClient) stabilize(current []apiRouter, start time.Time, startKnown bool) ([]apiRouter, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.dropGrace < 0 || c.accepted == nil {
-		c.accept(current)
-		return current
+	now := c.now()
+	settling := startKnown && c.settle > 0 && now.Sub(start) < c.settle
+
+	if c.accepted == nil {
+		if settling {
+			return nil, fmt.Errorf("traefik started %s ago; waiting until it has run for %s before trusting its router list",
+				now.Sub(start).Round(time.Second), c.settle)
+		}
+		c.accept(current, start, startKnown)
+		return current, nil
+	}
+
+	if settling && !c.acceptedStart.IsZero() && !start.Equal(c.acceptedStart) {
+		if !c.restartLoggedFor.Equal(start) {
+			c.restartLoggedFor = start
+			c.logger.Warn("traefik restarted; keeping previous hostnames until it settles",
+				"endpoint", c.endpoint(),
+				"started", start.UTC().Format(time.RFC3339),
+				"settle", c.settle.String(),
+			)
+		}
+		return mergeRouters(c.accepted, current), nil
+	}
+
+	if c.dropGrace < 0 {
+		c.accept(current, start, startKnown)
+		return current, nil
 	}
 
 	reason := suspiciousDrop(c.accepted, current)
@@ -282,11 +394,10 @@ func (c *apiClient) stabilize(current []apiRouter) []apiRouter {
 			c.logger.Info("traefik api router list recovered; drop guard released",
 				"endpoint", c.endpoint())
 		}
-		c.accept(current)
-		return current
+		c.accept(current, start, startKnown)
+		return current, nil
 	}
 
-	now := c.now()
 	if c.holdSince.IsZero() {
 		c.holdSince = now
 		c.logger.Warn("traefik api router list dropped suspiciously; keeping previous hostnames",
@@ -301,16 +412,19 @@ func (c *apiClient) stabilize(current []apiRouter) []apiRouter {
 			"reason", reason,
 			"held", held.Round(time.Second).String(),
 		)
-		c.accept(current)
-		return current
+		c.accept(current, start, startKnown)
+		return current, nil
 	}
-	return mergeRouters(c.accepted, current)
+	return mergeRouters(c.accepted, current), nil
 }
 
 // accept records current as the last complete router list. Callers hold c.mu.
-func (c *apiClient) accept(current []apiRouter) {
+func (c *apiClient) accept(current []apiRouter, start time.Time, startKnown bool) {
 	c.accepted = append([]apiRouter{}, current...)
 	c.holdSince = time.Time{}
+	if startKnown {
+		c.acceptedStart = start
+	}
 }
 
 // suspiciousDrop explains why current looks like an incomplete version of
@@ -427,6 +541,7 @@ func routerProvider(r apiRouter) string {
 // DiscoverFromAPI fetches routers from the Traefik API and extracts hostnames
 // using the same entrypoint semantics as file discovery.
 func (p *Parser) DiscoverFromAPI(ctx context.Context, c *apiClient) ([]HostnameExtraction, error) {
+	start, startKnown := c.traefikStart(ctx)
 	fetched, err := c.fetchRouters(ctx)
 	if err != nil {
 		return nil, err
@@ -441,7 +556,10 @@ func (p *Parser) DiscoverFromAPI(ctx context.Context, c *apiClient) ([]HostnameE
 		}
 		included = append(included, r)
 	}
-	routers := c.stabilize(included)
+	routers, err := c.stabilize(included, start, startKnown)
+	if err != nil {
+		return nil, err
+	}
 
 	type seenKey struct {
 		hostname   string
